@@ -29,8 +29,9 @@ Android omits the SDRplay plugin at CMake configuration time. Desktop SDRplay bu
 
 ## Changed files
 
+* `android/main.cpp`: preserve EGL across Activity pause/resume, suspend rendering while paused, and release EGL only when its window is destroyed.
 * `android/app/src/main/java/MainActivity.kt`: asynchronous permission state/receiver and receiver cleanup.
-* `android/app/src/main/AndroidManifest.xml`: proper USB host feature and device-filter placement; remove fictitious USB permission declarations.
+* `android/app/src/main/AndroidManifest.xml`: single native Activity on USB reattachment, proper USB host feature and device-filter placement; remove fictitious USB permission declarations.
 * `plugins/sdr_sources/rtlsdr_sdr_support/CMakeLists.txt`: Android catalog generation and JNI/libusb include paths.
 * `plugins/sdr_sources/rtlsdr_sdr_support/rtlsdr_android.h` and `rtlsdr_android.cpp`: permission bridge and safe path-based enumeration/lookup.
 * `plugins/sdr_sources/rtlsdr_sdr_support/rtlsdr_sdr.h` and `rtlsdr_sdr.cpp`: Recorder readiness, open diagnostics/cleanup, disconnect and cancellation handling.
@@ -38,7 +39,7 @@ Android omits the SDRplay plugin at CMake configuration time. Desktop SDRplay bu
 * `plugins/sdr_sources/sdrplay_sdr_support/CMakeLists.txt`: Android exclusion.
 * `src-core/common/dsp_source_sink/dsp_sample_source.h`: Android-only readiness hooks with defaults preserving other sources.
 * `src-interface/recorder/recorder.h`, `recorder.cpp` and `recorder_proc.cpp`: asynchronous RTL-SDR Start and waiting UI.
-* `src-testing/android_rtl_usb/`: executable regression harness, USB/JNI and source lifecycle cases, and mock UI/DSP fixtures.
+* `src-testing/android_rtl_usb/`: executable regression harness, USB/JNI and source lifecycle cases, mock UI/DSP fixtures, and actual native Activity command-handler pause/resume regression coverage.
 * `docs/android-direct-rtl.md`: this report.
 
 No SDK, AGP, Kotlin, NDK, app version, application ID or dependency revision was changed. No signing configuration was edited.
@@ -64,7 +65,7 @@ Artifacts in `build/artifacts/`:
 * `android-direct-rtl-build.log`
 * `android-direct-rtl-tests.log`
 
-APK SHA-256: `8fe0e00018472c2e52c0391cebbe1fcb6225d6950fe1c54fe9b8ad054a3d2dd1`.
+APK SHA-256: `d7a7beb0cb3f4a2f2a317c848728190c0ee41fbfe389249c2dc9a4416258e3ca`.
 
 Run the regression harness with:
 
@@ -74,7 +75,9 @@ python3 src-testing/android_rtl_usb/run.py --ndk /path/to/android-ndk-r25c
 
 ## Remaining hardware validation and limitations
 
-ADB device enumeration was empty, including after APK assembly. Installation and the real USB permission dialog, RF reception/waterfall, tablet Stop/Start and unplug behavior could not be tested on the Xiaomi Pad 6. These acceptance checks remain hardware-unverified.
+The tablet became available over wireless ADB after the original implementation commit. Testing on Xiaomi Pad 6 / Android 14 / HyperOS found two additional lifecycle bugs: `PAUSE` destroyed EGL but `RESUME` did not rebuild it after a dialog; USB attachment launched a second NativeActivity, sharing native ImGui globals and failing an unfinished-frame assertion. The renderer now survives pause/resume, and `singleTask` routes new USB intents to the existing native Activity.
+
+The updated APK was installed successfully. Native RTL reception at 100 MHz / 250 ksps populated the spectrum and waterfall; the center spike alone does not identify an external RF station. Stop joined the receive worker and a second Start successfully reopened the tuner and resumed reception. Physical unplug returned read result -5, stopped the receive worker/pipeline, released the device and logged detach. After the additional Activity fix, a second physical unplug/replug retained PID 24806 with no crash; source refresh and Start reopened the tuner and resumed reception in the same session. An explicit repeated USB attachment intent was also delivered to the existing Activity. Permission grant/denial is covered by the mocked harness; the existing tablet session had already granted USB permission before this reception test.
 
 USB paths can change on reattachment, so refresh/reselect the device after unplugging. After receive failure, Recorder retains the selected source and stops reception automatically. The NDSP flowgraph already starts devices on its flowgraph worker. That worker waits for the asynchronous permission result and continues opening after the grant; Stop can cancel this permission wait. Recorder uses frame polling and an opening worker.
 

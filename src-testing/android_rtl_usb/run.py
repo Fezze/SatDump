@@ -4,12 +4,14 @@ import argparse
 import pathlib
 import subprocess
 import tempfile
+import sys
 
 parser = argparse.ArgumentParser()
 parser.add_argument('--ndk', required=True, type=pathlib.Path)
 args = parser.parse_args()
 root = pathlib.Path(__file__).resolve().parents[2]
 fixture = pathlib.Path(__file__).resolve().parent
+subprocess.run([sys.executable, str(fixture / 'lifecycle_check.py')], check=True)
 plugin = root / 'plugins/sdr_sources/rtlsdr_sdr_support'
 with tempfile.TemporaryDirectory(prefix='satdump-rtl-usb-') as directory:
     work = pathlib.Path(directory)

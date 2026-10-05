@@ -13,6 +13,7 @@
             android:name="com.altillimity.satdump.MainActivity"
             android:icon="@mipmap/ic_launcher_round"
             android:theme="@android:style/Theme.NoTitleBar.Fullscreen"
+            android:launchMode="singleTask"
             android:configChanges="orientation|keyboardHidden|screenSize"
             android:exported="true">
             <meta-data android:name="android.app.lib_name"
