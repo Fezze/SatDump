@@ -1,6 +1,9 @@
 #pragma once
 
 #include "core/config.h"
+#ifdef __ANDROID__
+#include <future>
+#endif
 #include "handlers/handler.h"
 #include "i18n.h"
 #include "imgui/imgui.h"
@@ -84,6 +87,10 @@ namespace satdump
     protected:
         uint64_t frequency_hz = 100000000;
         bool show_waterfall = true;
+#ifdef __ANDROID__
+        bool start_pending = false;
+        std::future<void> start_future;
+#endif
         bool is_started = false, is_recording = false, is_processing = false, is_stopping_processing = false;
 
         double xconverter_frequency = 0;

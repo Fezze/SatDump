@@ -84,7 +84,11 @@ namespace satdump
         if (is_started)
             return;
 
+#ifdef __ANDROID__
+        if (!start_pending) set_frequency(frequency_hz);
+#else
         set_frequency(frequency_hz);
+#endif
 
         try
         {
@@ -92,7 +96,26 @@ namespace satdump
             if (current_samplerate == 0)
                 throw satdump_exception("Samplerate not set!");
 
+#ifdef __ANDROID__
+            if (source_ptr->needs_async_start())
+            {
+                start_pending = true;
+                if (!start_future.valid())
+                {
+                    if (!source_ptr->ready_to_start()) return;
+                    // Opening/probing the tuner can take time. Keep it off the render thread.
+                    auto source = source_ptr;
+                    start_future = std::async(std::launch::async, [source] { source->start(); });
+                    return;
+                }
+                if (start_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+                start_future.get();
+                start_pending = false;
+            }
+            else source_ptr->start();
+#else
             source_ptr->start();
+#endif
 
             if (current_decimation > 1)
             {
@@ -111,6 +134,11 @@ namespace satdump
         }
         catch (std::runtime_error &e)
         {
+#ifdef __ANDROID__
+            start_pending = false;
+            source_ptr->cancel_prepare_start();
+            source_ptr->stop();
+#endif
             sdr_error.set_message(style::theme.red, e.what());
             logger->error(e.what());
         }
@@ -118,6 +146,14 @@ namespace satdump
 
     void RecorderApplication::stop()
     {
+#ifdef __ANDROID__
+        // A permission wait can be cancelled; a native open is allowed to finish.
+        if (start_pending && !start_future.valid())
+        {
+            start_pending = false;
+            source_ptr->cancel_prepare_start();
+        }
+#endif
         if (!is_started)
             return;
 

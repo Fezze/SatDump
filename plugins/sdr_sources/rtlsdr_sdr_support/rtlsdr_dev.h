@@ -4,6 +4,7 @@
 #include "dsp/block.h"
 #include "dsp/device/dev.h"
 #include "logger.h"
+#include <atomic>
 
 #ifdef __ANDROID__
 #include "rtl-sdr.h"
@@ -35,13 +36,17 @@ namespace satdump
 
         private:
             bool is_open = false, is_started = false;
-            rtlsdr_dev *rtlsdr_dev_obj;
+            rtlsdr_dev *rtlsdr_dev_obj = nullptr;
             std::vector<int> available_gains = {0, 496};
 
             static void _rx_callback(unsigned char *buf, uint32_t len, void *ctx);
 
             std::thread work_thread;
-            bool thread_should_run = false;
+            std::atomic<bool> thread_should_run{false};
+            std::atomic<bool> thread_exited{true};
+#ifdef __ANDROID__
+            std::atomic<bool> permission_waiting{false}, permission_cancelled{false};
+#endif
             void mainThread()
             {
                 int buffer_size = 8192; // TODOREWORK calculate_buffer_size_from_samplerate(samplerate_widget.get_value());
@@ -49,7 +54,17 @@ namespace satdump
                 logger->trace("RTL-SDR Buffer size %d", buffer_size);
 
                 while (thread_should_run)
-                    rtlsdr_read_async(rtlsdr_dev_obj, _rx_callback, this, 0, buffer_size);
+                {
+                    int rc = rtlsdr_read_async(rtlsdr_dev_obj, _rx_callback, this, 0, buffer_size);
+                    if (rc != 0 || thread_should_run)
+                    {
+                        if (thread_should_run)
+                            logger->error("RTL-SDR reception ended (USB disconnected or read result %d)", rc);
+                        thread_should_run = false;
+                        break;
+                    }
+                }
+                thread_exited = true;
             }
 
         public:
