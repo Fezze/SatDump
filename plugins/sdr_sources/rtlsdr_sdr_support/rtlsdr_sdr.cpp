@@ -189,13 +189,13 @@ void RtlSdrSource::start()
 #ifdef __ANDROID__
     if (!rtl_android::permission(d_sdr_id, false))
         throw satdump_exception("Waiting for USB permission for RTL-SDR");
-    int index = rtl_android::index(d_sdr_id);
+    int rc = rtlsdr_open_path(&rtlsdr_dev_obj, d_sdr_id.c_str());
 #else
     int index = rtlsdr_get_index_by_serial(d_sdr_id.c_str());
     if (index < 0)
         throw satdump_exception("RTL-SDR dongle was not found (lookup code " + std::to_string(index) + ")");
-#endif
     int rc = rtlsdr_open(&rtlsdr_dev_obj, index);
+#endif
     if (rc != 0)
     {
         rtlsdr_dev_obj = nullptr;

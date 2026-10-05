@@ -85,6 +85,19 @@ namespace satdump
             return;
 
 #ifdef __ANDROID__
+        if (start_pending && start_cancelled)
+        {
+            if (start_future.valid())
+            {
+                if (start_future.wait_for(std::chrono::seconds(0)) != std::future_status::ready) return;
+                try { start_future.get(); } catch (const std::exception &) {}
+                source_ptr->stop();
+            }
+            start_pending = false;
+            start_cancelled = false;
+            source_ptr->cancel_prepare_start();
+            return;
+        }
         if (!start_pending) set_frequency(frequency_hz);
 #else
         set_frequency(frequency_hz);
@@ -99,6 +112,7 @@ namespace satdump
 #ifdef __ANDROID__
             if (source_ptr->needs_async_start())
             {
+                if (!start_pending) start_cancelled = false;
                 start_pending = true;
                 if (!start_future.valid())
                 {
@@ -147,11 +161,17 @@ namespace satdump
     void RecorderApplication::stop()
     {
 #ifdef __ANDROID__
-        // A permission wait can be cancelled; a native open is allowed to finish.
-        if (start_pending && !start_future.valid())
+        pending_tracking.clear();
+        // Let an already-running native open finish, then close it without
+        // connecting the stream or executing deferred AOS actions.
+        if (start_pending)
         {
-            start_pending = false;
-            source_ptr->cancel_prepare_start();
+            start_cancelled = true;
+            if (!start_future.valid())
+            {
+                start_pending = false;
+                source_ptr->cancel_prepare_start();
+            }
         }
 #endif
         if (!is_started)
@@ -328,120 +348,204 @@ namespace satdump
         {
             tracking_widget = new TrackingWidget(cli_set);
 
-            tracking_widget->aos_callback = [this](AutoTrackCfg autotrack_cfg, SatellitePass, TrackedObject obj)
+            tracking_widget->aos_callback = [this](AutoTrackCfg cfg, SatellitePass pass, TrackedObject obj)
             {
-                if (autotrack_cfg.multi_mode || obj.downlinks.size() > 1)
-                {
-                    if (!autotrack_cfg.multi_mode)
-                    {
-                        double center_freq = 0;
-                        for (auto &dl : obj.downlinks)
-                            center_freq += dl.frequency;
-                        center_freq /= obj.downlinks.size();
-                        set_frequency(center_freq);
-                    }
-
-                    for (auto &dl : obj.downlinks)
-                    {
-                        if (dl.live || dl.record)
-                            if (!is_started)
-                                start();
-
-                        if (dl.live)
-                        {
-                            std::string id = std::to_string(obj.norad) + "_" + std::to_string(dl.frequency) + "_live";
-                            std::string name = std::to_string(obj.norad);
-                            std::optional<TLE> this_tle = satdump::db_keplers->get_from_norad(obj.norad);
-                            if (this_tle.has_value())
-                                name = this_tle->name;
-                            name += " - " + format_notated(dl.frequency, "Hz");
-                            add_vfo_live(id, name, dl.frequency, dl.pipeline_selector->selected_pipeline, dl.pipeline_selector->getParameters());
-                        }
-
-                        if (dl.record)
-                        {
-                            std::string id = std::to_string(obj.norad) + "_" + std::to_string(dl.frequency) + "_record";
-                            std::string name = std::to_string(obj.norad);
-                            std::optional<TLE> this_tle = satdump::db_keplers->get_from_norad(obj.norad);
-                            if (this_tle.has_value())
-                                name = this_tle->name;
-                            name += " - " + format_notated(dl.frequency, "Hz");
-                            add_vfo_reco(id, name, dl.frequency, dl.baseband_format, dl.baseband_decimation);
-                        }
-                    }
-                }
-                else
-                {
-                    if (obj.downlinks[0].live)
-                        stop_processing();
-                    if (obj.downlinks[0].record)
-                        stop_recording();
-
-                    if (obj.downlinks[0].live || obj.downlinks[0].record)
-                    {
-                        frequency_hz = obj.downlinks[0].frequency;
-                        if (is_started)
-                            set_frequency(frequency_hz);
-                        else
-                            start();
-
-                        // Catch situations where source could not start
-                        if (!is_started)
-                        {
-                            logger->error("Could not start recorder/processor since the source could not be started!");
-                            return;
-                        }
-                    }
-
-                    if (obj.downlinks[0].live)
-                    {
-                        pipeline_selector.select_pipeline(obj.downlinks[0].pipeline_selector->selected_pipeline.id);
-                        pipeline_selector.setParameters(obj.downlinks[0].pipeline_selector->getParameters());
-                        pipeline_selector.selected_pipeline.steps = obj.downlinks[0].pipeline_selector->selected_pipeline.steps;
-                        start_processing();
-                    }
-
-                    if (obj.downlinks[0].record)
-                    {
-                        file_sink->set_output_sample_type(obj.downlinks[0].baseband_format);
-                        start_recording();
-                    }
-                }
+#ifdef __ANDROID__
+                std::lock_guard<std::mutex> lock(tracking_events_mutex);
+                tracking_events.push_back({true, cfg, pass, obj});
+#else
+                tracking_aos(cfg, pass, obj);
+#endif
             };
 
-            tracking_widget->los_callback = [this](AutoTrackCfg autotrack_cfg, SatellitePass, TrackedObject obj)
+            tracking_widget->los_callback = [this](AutoTrackCfg cfg, SatellitePass pass, TrackedObject obj)
             {
-                if (autotrack_cfg.multi_mode || obj.downlinks.size() > 1)
+#ifdef __ANDROID__
+                std::lock_guard<std::mutex> lock(tracking_events_mutex);
+                tracking_events.push_back({false, cfg, pass, obj});
+#else
+                tracking_los(cfg, pass, obj);
+#endif
+            };
+        }
+    }
+
+#ifdef __ANDROID__
+    void RecorderApplication::poll_tracking()
+    {
+        // The scheduler runs on a worker. All Recorder state transitions and
+        // future consumption must happen on the render thread.
+        std::deque<TrackingEvent> events;
+        {
+            std::lock_guard<std::mutex> lock(tracking_events_mutex);
+            events.swap(tracking_events);
+        }
+        for (auto &event : events)
+            if (event.aos)
+                tracking_aos(event.cfg, event.pass, event.object);
+            else
+                tracking_los(event.cfg, event.pass, event.object);
+
+        if (start_pending) start();
+        if (!start_pending && !is_started)
+            pending_tracking.clear(); // Open failed or was cancelled.
+        if (is_started)
+        {
+            auto pending = std::move(pending_tracking);
+            pending_tracking.clear();
+            for (auto &entry : pending)
+                if (getTime() < entry.second.pass.los_time)
+                    tracking_aos(entry.second.cfg, entry.second.pass, entry.second.object);
+        }
+    }
+#endif
+
+    void RecorderApplication::tracking_aos(AutoTrackCfg autotrack_cfg, SatellitePass pass, TrackedObject obj)
+    {
+        if (obj.downlinks.empty()) return;
+#ifdef __ANDROID__
+        if (getTime() >= pass.los_time) return;
+        bool needs_source = false;
+        for (auto &dl : obj.downlinks) needs_source |= dl.live || dl.record;
+        if (needs_source && !is_started)
+        {
+            if (!start_pending)
+            {
+                if (!autotrack_cfg.multi_mode)
                 {
-                    for (auto &dl : obj.downlinks)
-                    {
-                        if (dl.live)
-                        {
-                            std::string id = std::to_string(obj.norad) + "_" + std::to_string(dl.frequency) + "_live";
-                            del_vfo(id);
-                        }
-
-                        if (dl.record)
-                        {
-                            std::string id = std::to_string(obj.norad) + "_" + std::to_string(dl.frequency) + "_record";
-                            del_vfo(id);
-                        }
-
-                        if (dl.live || dl.record)
-                            if (is_started && vfo_list.size() == 0 && autotrack_cfg.stop_sdr_when_idle)
-                                stop();
-                    }
+                    double center = 0;
+                    for (auto &dl : obj.downlinks) center += dl.frequency;
+                    frequency_hz = center / obj.downlinks.size();
                 }
-                else
+                start();
+            }
+            if (start_pending)
+            {
+                pending_tracking.insert_or_assign(obj.norad, TrackingEvent{true, autotrack_cfg, pass, obj});
+                return;
+            }
+            if (!is_started)
+            {
+                logger->error("Could not start tracking reception: the source could not be started!");
+                return;
+            }
+        }
+#endif
+        if (autotrack_cfg.multi_mode || obj.downlinks.size() > 1)
+        {
+            if (!autotrack_cfg.multi_mode)
+            {
+                double center_freq = 0;
+                for (auto &dl : obj.downlinks)
+                    center_freq += dl.frequency;
+                center_freq /= obj.downlinks.size();
+                set_frequency(center_freq);
+            }
+
+            for (auto &dl : obj.downlinks)
+            {
+                if (dl.live || dl.record)
+                    if (!is_started)
+                        start();
+
+                if (dl.live)
                 {
-                    if (obj.downlinks[0].record)
-                        stop_recording();
-                    if (obj.downlinks[0].live)
-                        stop_processing();
-                    if (autotrack_cfg.stop_sdr_when_idle)
+                    std::string id = std::to_string(obj.norad) + "_" + std::to_string(dl.frequency) + "_live";
+                    std::string name = std::to_string(obj.norad);
+                    std::optional<TLE> this_tle = satdump::db_keplers->get_from_norad(obj.norad);
+                    if (this_tle.has_value())
+                        name = this_tle->name;
+                    name += " - " + format_notated(dl.frequency, "Hz");
+                    add_vfo_live(id, name, dl.frequency, dl.pipeline_selector->selected_pipeline, dl.pipeline_selector->getParameters());
+                }
+
+                if (dl.record)
+                {
+                    std::string id = std::to_string(obj.norad) + "_" + std::to_string(dl.frequency) + "_record";
+                    std::string name = std::to_string(obj.norad);
+                    std::optional<TLE> this_tle = satdump::db_keplers->get_from_norad(obj.norad);
+                    if (this_tle.has_value())
+                        name = this_tle->name;
+                    name += " - " + format_notated(dl.frequency, "Hz");
+                    add_vfo_reco(id, name, dl.frequency, dl.baseband_format, dl.baseband_decimation);
+                }
+            }
+        }
+        else
+        {
+            if (obj.downlinks[0].live)
+                stop_processing();
+            if (obj.downlinks[0].record)
+                stop_recording();
+
+            if (obj.downlinks[0].live || obj.downlinks[0].record)
+            {
+                frequency_hz = obj.downlinks[0].frequency;
+                if (is_started)
+                    set_frequency(frequency_hz);
+                else
+                    start();
+
+                // Catch situations where source could not start
+                if (!is_started)
+                {
+                    logger->error("Could not start recorder/processor since the source could not be started!");
+                    return;
+                }
+            }
+
+            if (obj.downlinks[0].live)
+            {
+                pipeline_selector.select_pipeline(obj.downlinks[0].pipeline_selector->selected_pipeline.id);
+                pipeline_selector.setParameters(obj.downlinks[0].pipeline_selector->getParameters());
+                pipeline_selector.selected_pipeline.steps = obj.downlinks[0].pipeline_selector->selected_pipeline.steps;
+                start_processing();
+            }
+
+            if (obj.downlinks[0].record)
+            {
+                file_sink->set_output_sample_type(obj.downlinks[0].baseband_format);
+                start_recording();
+            }
+        }
+    }
+
+    void RecorderApplication::tracking_los(AutoTrackCfg autotrack_cfg, SatellitePass pass, TrackedObject obj)
+    {
+        if (obj.downlinks.empty()) return;
+#ifdef __ANDROID__
+        pending_tracking.erase(obj.norad);
+        if (start_pending && pending_tracking.empty()) stop();
+#endif
+        if (autotrack_cfg.multi_mode || obj.downlinks.size() > 1)
+        {
+            for (auto &dl : obj.downlinks)
+            {
+                if (dl.live)
+                {
+                    std::string id = std::to_string(obj.norad) + "_" + std::to_string(dl.frequency) + "_live";
+                    del_vfo(id);
+                }
+
+                if (dl.record)
+                {
+                    std::string id = std::to_string(obj.norad) + "_" + std::to_string(dl.frequency) + "_record";
+                    del_vfo(id);
+                }
+
+                if (dl.live || dl.record)
+                    if (is_started && vfo_list.size() == 0 && autotrack_cfg.stop_sdr_when_idle)
                         stop();
-                }
-            };
+            }
+        }
+        else
+        {
+            if (obj.downlinks[0].record)
+                stop_recording();
+            if (obj.downlinks[0].live)
+                stop_processing();
+            if (autotrack_cfg.stop_sdr_when_idle)
+                stop();
         }
     }
 } // namespace satdump

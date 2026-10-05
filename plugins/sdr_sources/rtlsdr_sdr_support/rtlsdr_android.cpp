@@ -44,22 +44,14 @@ namespace rtl_android
         return result;
     }
 
-    int index(const std::string &path)
-    {
-        for (const auto &device : devices())
-            if (device.path == path)
-                return device.index;
-        throw satdump_exception("RTL-SDR dongle is not connected (refresh the source list)");
-    }
-
-    void wait_permission(const std::string &path, const std::atomic<bool> &cancelled)
+    void wait_permission(const std::string &path, const std::function<bool()> &cancelled)
     {
         bool request = true;
-        while (!cancelled)
+        while (!cancelled())
         {
             if (permission(path, request))
             {
-                if (cancelled) break;
+                if (cancelled()) break;
                 return;
             }
             request = false;

@@ -224,6 +224,12 @@ namespace satdump
 
     RecorderApplication::~RecorderApplication()
     {
+        // Stop scheduler callbacks before destroying the resources they use.
+        if (tracking_widget != nullptr)
+        {
+            delete tracking_widget;
+            tracking_widget = nullptr;
+        }
 #ifdef __ANDROID__
         if (start_future.valid())
         {
@@ -259,7 +265,7 @@ namespace satdump
     void RecorderApplication::drawMenu()
     {
 #ifdef __ANDROID__
-        if (start_pending) start();
+        poll_tracking();
         if (is_started && source_ptr->stream_has_ended())
         {
             stop();
